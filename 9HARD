@@ -1,0 +1,165 @@
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/traffic-control-module.h"
+#include "ns3/flow-monitor-module.h"
+
+using namespace ns3;
+
+NS_LOG_COMPONENT_DEFINE ("TcpComparisonNewRenoCubic");
+
+int main (int argc, char *argv[]) {
+  uint32_t nFlows = 4;
+  double simDuration = 20.0; // seconds
+  std::string tcpTypeId = "ns3::TcpCubic"; // Change to "ns3::TcpNewReno" for comparison
+  double bottleneckBw = 10.0; // Mbps
+  double bottleneckDelay = 50.0; // ms
+  double errorRate = 0.00001; // Packet Error Rate
+
+  CommandLine cmd (__FILE__);
+  cmd.AddValue ("tcpType", "Transport protocol: ns3::TcpCubic or ns3::TcpNewReno", tcpTypeId);
+  cmd.AddValue ("nFlows", "Number of concurrent TCP flows", nFlows);
+  cmd.AddValue ("bw", "Bottleneck bandwidth (Mbps)", bottleneckBw);
+  cmd.AddValue ("delay", "Bottleneck delay (ms)", bottleneckDelay);
+  cmd.AddValue ("error", "Packet error rate", errorRate);
+  cmd.Parse (argc, argv);
+
+  Config::SetDefault ("ns3::TcpL4Protocol::SocketType", StringValue (tcpTypeId));
+
+  // Create nodes
+  NodeContainer senders, receivers;
+  senders.Create (nFlows);
+  receivers.Create (nFlows);
+
+  NodeContainer r1r2;
+  r1r2.Create (2); // R1 and R2
+
+  PointToPointHelper p2pAccess;
+  p2pAccess.SetDeviceAttribute ("DataRate", StringValue ("100Mbps"));
+  p2pAccess.SetChannelAttribute ("Delay", StringValue ("2ms"));
+
+  PointToPointHelper p2pBottleneck;
+  p2pBottleneck.SetDeviceAttribute ("DataRate", StringValue (std::to_string (bottleneckBw) + "Mbps"));
+  p2pBottleneck.SetChannelAttribute ("Delay", StringValue (std::to_string (bottleneckDelay) + "ms"));
+
+  // Add error model on bottleneck link
+  Ptr<RateErrorModel> em = CreateObject<RateErrorModel> ();
+  em->SetAttribute ("ErrorRate", DoubleValue (errorRate));
+
+  InternetStackHelper stack;
+  stack.InstallAll ();
+
+  // Assign IP addresses
+  Ipv4AddressHelper address;
+  Ipv4InterfaceContainer r1r2Interfaces;
+
+  // Link between R1 and R2
+  NetDeviceContainer r1r2Devices = p2pBottleneck.Install (r1r2);
+  r1r2Devices.Get (1)->SetAttribute ("ReceiveErrorModel", PointerValue (em));
+  address.SetBase ("10.1.1.0", "255.255.255.0");
+  r1r2Interfaces = address.Assign (r1r2Devices);
+
+  // Store receiver IP addresses to bind sources accurately
+  std::vector<Ipv4Address> receiverIps;
+
+  // Access links for senders and receivers
+  for (uint32_t i = 0; i < nFlows; ++i)
+    {
+      NodeContainer senderPair (senders.Get (i), r1r2.Get (0));
+      NetDeviceContainer senderDevices = p2pAccess.Install (senderPair);
+      std::ostringstream subnet;
+      subnet << "10.1." << (i + 2) << ".0";
+      address.SetBase (subnet.str ().c_str (), "255.255.255.0");
+      address.Assign (senderDevices);
+
+      NodeContainer receiverPair (r1r2.Get (1), receivers.Get (i)); // Fixed 'b' -> 'i'
+      NetDeviceContainer receiverDevices = p2pAccess.Install (receiverPair);
+      std::ostringstream rsubnet;
+      rsubnet << "10.2." << (i + 2) << ".0";
+      address.SetBase (rsubnet.str ().c_str (), "255.255.255.0");
+      Ipv4InterfaceContainer rxIf = address.Assign (receiverDevices);
+      receiverIps.push_back (rxIf.GetAddress (1)); // IP on the receiver node
+    }
+
+  Ipv4GlobalRoutingHelper::PopulateRoutingTables ();
+
+  // Install applications (BulkSend + PacketSink)
+  uint16_t port = 5000;
+  for (uint32_t i = 0; i < nFlows; ++i)
+    {
+      Address sinkAddress (InetSocketAddress (Ipv4Address::GetAny (), port + i));
+      PacketSinkHelper packetSinkHelper ("ns3::TcpSocketFactory", sinkAddress);
+      ApplicationContainer sinkApps = packetSinkHelper.Install (receivers.Get (i));
+      sinkApps.Start (Seconds (0.0));
+      sinkApps.Stop (Seconds (simDuration));
+
+      // Fixed receiver IP retrieval
+      Address remoteAddress (InetSocketAddress (receiverIps[i], port + i));
+      BulkSendHelper sourceHelper ("ns3::TcpSocketFactory", remoteAddress);
+      sourceHelper.SetAttribute ("MaxBytes", UintegerValue (0)); // Unlimited
+      ApplicationContainer sourceApps = sourceHelper.Install (senders.Get (i));
+      sourceApps.Start (Seconds (1.0 + i * 0.1));
+      sourceApps.Stop (Seconds (simDuration));
+    }
+
+  // Flow Monitor
+  FlowMonitorHelper flowmon;
+  Ptr<FlowMonitor> monitor = flowmon.InstallAll ();
+
+  Simulator::Stop (Seconds (simDuration));
+  Simulator::Run ();
+
+  monitor->CheckForLostPackets ();
+  Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier> (flowmon.GetClassifier ());
+  std::map<FlowId, FlowMonitor::FlowStats> stats = monitor->GetFlowStats ();
+
+  double totalRxBytes = 0;
+  double totalDelay = 0;
+  uint32_t totalPacketsDropped = 0;
+  uint32_t totalTxPackets = 0;
+  uint32_t flowCount = 0;
+
+  for (auto i = stats.begin (); i != stats.end (); ++i)
+    {
+      Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow (i->first);
+      if (t.destinationPort >= 5000)
+        {
+          double throughput = i->second.rxBytes * 8.0 / (simDuration * 1024.0 * 1024.0); // Mbps
+          totalRxBytes += i->second.rxBytes;
+          if (i->second.rxPackets > 0)
+            totalDelay += i->second.delaySum.GetSeconds () / i->second.rxPackets;
+          totalPacketsDropped += i->second.lostPackets;
+          totalTxPackets += i->second.txPackets;
+          flowCount++;
+          std::cout << "Flow " << i->first << " (" << t.sourceAddress << " -> " << t.destinationAddress
+                     << ") Throughput: " << throughput << " Mbps\n";
+        }
+    }
+
+  // Calculate Jain's Fairness Index: (sum(xi))^2 / (n * sum(xi^2))
+  double sumThroughput = 0;
+  double sumSqThroughput = 0;
+  for (auto i = stats.begin (); i != stats.end (); ++i)
+    {
+      Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow (i->first);
+      if (t.destinationPort >= 5000)
+        {
+          double th = i->second.rxBytes * 8.0 / (simDuration * 1024.0 * 1024.0);
+          sumThroughput += th;
+          sumSqThroughput += (th * th);
+        }
+    }
+  double fairnessIndex = (flowCount > 0 && sumSqThroughput > 0) ? (sumThroughput * sumThroughput) / (flowCount * sumSqThroughput) : 0;
+
+  std::cout << "--- Summary for " << tcpTypeId << " ---" << std::endl;
+  std::cout << "Aggregate Throughput: " << (totalRxBytes * 8.0 / (simDuration * 1024.0 * 1024.0)) << " Mbps" << std::endl;
+  std::cout << "Jain's Fairness Index: " << fairnessIndex << std::endl;
+  std::cout << "Total Packets Dropped: " << totalPacketsDropped << std::endl;
+  std::cout << "Average End-to-End Delay: " << (flowCount > 0 ? (totalDelay / flowCount) * 1000.0 : 0) << " ms" << std::endl;
+
+  monitor->SerializeToXmlFile ("tcp-comparison-flowmon.xml", true, true);
+  Simulator::Destroy ();
+  return 0;
+}
